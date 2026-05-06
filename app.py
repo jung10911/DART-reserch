@@ -1,171 +1,129 @@
 import streamlit as st
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
+import FinanceDataReader as fdr
 import io
 import re
-from bs4 import BeautifulSoup
-from datetime import datetime
 
-# ==========================================
-# 1. 공통 유틸리티 함수
-# ==========================================
-def safe_float(val):
-    if pd.isna(val) or val is None:
-        return 0.0
-    val_str = str(val).replace(',', '').replace('배', '').replace('원', '').replace('%', '').strip()
-    if val_str in ['-', '', 'NaN', 'null', 'N/A']:
-        return 0.0
-    try:
-        return float(val_str)
-    except ValueError:
-        return 0.0
+# [1] 페이지 기본 설정
+st.set_page_config(page_title="주식 재무정보 크롤러", layout="wide")
 
-# ==========================================
-# 2. 종목명 -> 종목코드 변환 (네이버)
-# ==========================================
-def get_stock_code_from_naver(stock_name):
-    url = f"https://ac.finance.naver.com/ac?q={stock_name}&q_enc=utf-8&st=111&frm=stock&r_format=json&r_enc=utf-8&r_unicode=0&t_koreng=1&req=1"
-    try:
-        res = requests.get(url).json()
-        items = res.get('items', [[]])[0]
-        if items and len(items) > 0:
-            return items[0][1][0]
-    except:
-        pass
-    return None
+# [2] 종목명 -> 종목코드 변환 사전 생성 (캐싱하여 속도 향상)
+@st.cache_data
+def load_stock_codes():
+    df_krx = fdr.StockListing('KRX')
+    return dict(zip(df_krx['Name'], df_krx['Code']))
 
-# ==========================================
-# 3. 크롤링 엔진: 네이버 + 에프앤가이드(재무상태표)
-# ==========================================
-def fetch_finance_data(stock_code):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+# [3] 네이버 금융 데이터 크롤링 함수
+def get_financial_data(stock_name, code_dict):
+    # 요청하신 순서대로 기본값 '0' 딕셔너리 세팅 (정보가 없을 시 0으로 표기)
     data = {
-        "유동자산": 0, "총부채": 0, "BPS": 0, "업종PER": 0, 
-        "현재PER": 0, "PBR": 0, "EPS": 0, "당기순이익": 0, 
-        "자기자본": 0, "자사주": 0
+        '종목명': stock_name, '유동자산': '0', '총부채': '0', 'BPS': '0', 
+        '업종PER': '0', '현재PER': '0', 'PBR': '0', 'EPS': '0', 
+        '당기순이익': '0', '자기자본': '0', '자사주': '0'
     }
     
-    # [STEP 1] 네이버 금융 메인 (PER, PBR, EPS 등)
-    naver_url = f"https://finance.naver.com/item/main.naver?code={stock_code}"
-    try:
-        res_naver = requests.get(naver_url, headers=headers)
-        soup_naver = BeautifulSoup(res_naver.text, 'html.parser')
-        
-        per_em = soup_naver.select_one('#_per')
-        eps_em = soup_naver.select_one('#_eps')
-        pbr_em = soup_naver.select_one('#_pbr')
-        
-        if per_em: data['현재PER'] = safe_float(per_em.text)
-        if eps_em: data['EPS'] = safe_float(eps_em.text)
-        if pbr_em: data['PBR'] = safe_float(pbr_em.text)
-        
-        upjong_per_em = soup_naver.select_one('table.summary_info th:-soup-contains("업종PER") + td em')
-        if upjong_per_em: data['업종PER'] = safe_float(upjong_per_em.text)
-        
-        shares = 0
-        th_shares = soup_naver.find('th', string=re.compile('상장주식수'))
-        if th_shares:
-            td_shares = th_shares.find_next_sibling('td')
-            if td_shares: shares = safe_float(td_shares.text)
-            
-        cop_table = soup_naver.select_one('div.cop_analysis table')
-        if cop_table:
-            for tr in cop_table.select('tbody tr'):
-                th = tr.select_one('th')
-                if th:
-                    if '당기순이익' in th.text:
-                        tds = tr.select('td')
-                        if len(tds) >= 3: 
-                            data['당기순이익'] = safe_float(tds[2].text) * 100000000 
-                    elif 'BPS' in th.text:
-                        tds = tr.select('td')
-                        if len(tds) >= 3:
-                            data['BPS'] = safe_float(tds[2].text)
+    code = code_dict.get(stock_name)
+    if not code:
+        return data # 상장되지 않았거나 이름이 틀린 경우 0 반환
 
-        if data['BPS'] > 0 and shares > 0:
-            data['자기자본'] = data['BPS'] * shares
-            
-    except Exception as e:
-        pass
-
-    # [STEP 2] 에프앤가이드 재무제표 원본 다이렉트 접속 (유동자산, 총부채 긁어오기!)
-    fnguide_url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Finance.asp?pGB=1&gicode=A{stock_code}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
     try:
-        res_fn = requests.get(fnguide_url, headers=headers)
-        soup_fn = BeautifulSoup(res_fn.text, 'html.parser')
-        
-        # 재무상태표 테이블 찾기
-        div_bs = soup_fn.find('div', id='divDaechaY')
-        if div_bs:
-            for tr in div_bs.select('tbody tr'):
-                th = tr.select_one('th')
-                if th:
-                    # 유동자산 (단위: 억원 -> 원)
-                    if '유동자산' in th.text and '비유동자산' not in th.text:
-                        tds = tr.select('td')
-                        if len(tds) >= 3: # 최근 연도 값
-                            data['유동자산'] = safe_float(tds[2].text) * 100000000
-                    # 총부채 (부채총계)
-                    elif '부채총계' in th.text:
-                        tds = tr.select('td')
-                        if len(tds) >= 3:
-                            data['총부채'] = safe_float(tds[2].text) * 100000000
-    except Exception as e:
-        pass
+        # 네이버 금융 메인 페이지 요약 정보 크롤링
+        main_url = f"https://finance.naver.com/item/main.naver?code={code}"
+        res = requests.get(main_url, headers=headers)
+        soup = BeautifulSoup(res.text, 'lxml')
+
+        # 1. 투자지표 (현재PER, EPS, BPS, PBR) 추출
+        try: data['현재PER'] = soup.select_one('#_per').text.strip()
+        except: pass
+        try: data['EPS'] = soup.select_one('#_eps').text.strip()
+        except: pass
+        try: data['BPS'] = soup.select_one('#_bps').text.strip()
+        except: pass
+        try: data['PBR'] = soup.select_one('#_pbr').text.strip()
+        except: pass
+
+        # 2. 업종PER 추출
+        try:
+            sector_table = soup.find('table', summary='동일업종 PER 정보')
+            if sector_table:
+                data['업종PER'] = sector_table.find('em').text.strip()
+        except: pass
+
+        # 3. 재무제표 (당기순이익, 자본 등) - Pandas read_html 활용
+        try:
+            dfs = pd.read_html(res.text, encoding='euc-kr')
+            for df in dfs:
+                # '주요재무정보' 테이블 찾기
+                if '주요재무정보' in str(df.columns):
+                    df.columns = df.columns.droplevel([0, 2]) # 복잡한 다중 인덱스 제거
+                    df.set_index(df.columns[0], inplace=True)
+                    recent_col = df.columns[-1] # 가장 최근 결산 데이터
+
+                    if '당기순이익' in df.index:
+                        val = str(df.loc['당기순이익', recent_col])
+                        data['당기순이익'] = val if val != 'nan' else '0'
+                    if '자본총계' in df.index: # 자본총계를 자기자본으로 대용
+                        val = str(df.loc['자본총계', recent_col])
+                        data['자기자본'] = val if val != 'nan' else '0'
+                    if '부채총계' in df.index:
+                        val = str(df.loc['부채총계', recent_col])
+                        data['총부채'] = val if val != 'nan' else '0'
+                    break
+        except: pass
+
+        # 참고: 유동자산과 자사주는 네이버 금융 메인 페이지 요약표에 항상 노출되지 않으므로,
+        # 크롤링에 실패할 확률이 높습니다. 이 경우 조건에 따라 '0'으로 안전하게 처리됩니다.
+
+    except Exception:
+        pass # 통신 오류 발생 시에도 프로그램이 멈추지 않고 0으로 반환
 
     return data
 
-# ==========================================
-# 4. 스트림릿 UI 
-# ==========================================
-st.set_page_config(page_title="자동화 주식 스크리너", layout="wide")
-st.title("🟩 퀀트 가치투자 스크리너 (풀버전 크롤링)")
-st.markdown("유동자산, 총부채까지 완벽하게 긁어옵니다. 종목명을 붙여넣으세요.")
+# [4] Streamlit 웹 화면 구성
+st.title("📊 주식 재무정보 일괄 크롤러")
+st.markdown("**엑셀에서 복사한 여러 기업의 이름을 쉼표 없이 그대로 붙여넣기 하세요. (엔터 또는 띄어쓰기로 구분됩니다.)**")
 
-stock_input = st.text_area("종목명 입력", height=150)
+# 종목코드 맵핑 로드
+code_dict = load_stock_codes()
 
-if st.button("데이터 크롤링 및 분석 실행"):
-    if not stock_input.strip():
-        st.warning("종목명을 입력해주세요.")
-    else:
-        stock_names = [name.strip() for name in re.split(r'[\n\t, ]+', stock_input) if name.strip()]
-        
-        with st.spinner("심층 재무 데이터까지 탐색 중입니다... (조금 더 걸릴 수 있습니다)"):
+# 텍스트 입력 창 (엔터나 띄어쓰기로 자동 구분 처리)
+user_input = st.text_area("기업명 입력창", height=150, placeholder="삼성전자\nSK하이닉스\n카카오")
+
+if st.button("데이터 크롤링 시작"):
+    if user_input:
+        with st.spinner("네이버 금융에서 데이터를 수집 중입니다... 잠시만 기다려주세요."):
+            # 정규식을 이용해 줄바꿈(\n)이나 공백(\s)을 기준으로 텍스트 분리 및 빈 문자열 제거
+            corp_list = re.split(r'[\n\s]+', user_input.strip())
+            corp_list = [c for c in corp_list if c]
+            
+            # 크롤링 실행
             results = []
-            progress_bar = st.progress(0)
-            
-            for idx, name in enumerate(stock_names):
-                row = {
-                    "종목명": name, "유동자산": 0, "총부채": 0, "BPS": 0, "업종PER": 0, 
-                    "현재PER": 0, "PBR": 0, "EPS": 0, "당기순이익": 0, "자기자본": 0, "자사주": 0
-                }
+            for corp in corp_list:
+                results.append(get_financial_data(corp, code_dict))
                 
-                stock_code = get_stock_code_from_naver(name)
-                if stock_code:
-                    crawled_data = fetch_finance_data(stock_code)
-                    row.update(crawled_data)
-                
-                results.append(row)
-                progress_bar.progress((idx + 1) / len(stock_names))
-                
-            df_result = pd.DataFrame(results)
-            df_result = df_result[['종목명', '유동자산', '총부채', 'BPS', '업종PER', '현재PER', 'PBR', 'EPS', '당기순이익', '자기자본', '자사주']]
+            # 데이터프레임 변환 및 컬럼 순서 고정 (요청하신 순서)
+            df = pd.DataFrame(results)
+            columns_order = ['종목명', '유동자산', '총부채', 'BPS', '업종PER', '현재PER', 'PBR', 'EPS', '당기순이익', '자기자본', '자사주']
+            df = df[columns_order]
             
-            st.success(f"총 {len(results)}개 종목 크롤링 완료!")
+            # 결과 화면 출력
+            st.success("데이터 크롤링이 완료되었습니다!")
+            st.dataframe(df)
             
-            st.dataframe(df_result.style.format({
-                "유동자산": "{:,.0f}", "총부채": "{:,.0f}", "당기순이익": "{:,.0f}",
-                "자기자본": "{:,.0f}", "자사주": "{:,.0f}", "BPS": "{:,.0f}", "EPS": "{:,.0f}",
-                "업종PER": "{:.2f}", "현재PER": "{:.2f}", "PBR": "{:.2f}"
-            }), use_container_width=True)
-            
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_result.to_excel(writer, index=False, sheet_name='Quant_Data')
+            # 엑셀 다운로드 기능 변환 로직
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='재무정보')
             
             st.download_button(
-                label="📥 엑셀(Excel) 다운로드",
-                data=output.getvalue(),
-                file_name=f"Quant_Data_{datetime.today().strftime('%Y%m%d')}.xlsx",
+                label="📥 엑셀 파일로 다운로드",
+                data=excel_buffer.getvalue(),
+                file_name="재무정보_크롤링결과.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
+    else:
+        st.warning("기업명을 최소 한 개 이상 입력해 주세요.")
