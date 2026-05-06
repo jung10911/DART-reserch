@@ -1,5 +1,7 @@
 streamlit
 pandas
 requests
-openpyxl
 beautifulsoup4
+lxml
+finance-datareader
+openpyxl
