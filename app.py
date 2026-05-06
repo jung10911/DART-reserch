@@ -73,10 +73,11 @@ if st.button("🚀 야후 파이낸스 데이터 추출"):
             results = [get_yf_data(corp, ticker_map) for corp in corp_list]
                 
             df = pd.DataFrame(results)
-            # 숫자가 너무 크므로 보기 편하게 쉼표(,) 포맷팅 추가
+# 숫자가 너무 크므로 보기 편하게 쉼표(,) 포맷팅 추가
             numeric_cols = ['유동자산', '총부채', '당기순이익', '자기자본']
             for col in numeric_cols:
-                df[col] = pd.to_numeric(df[col], errors='ignore')
+                # 에러 발생 시 강제로 빈값(NaN) 처리 후 0으로 채움
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             
             st.success("데이터 추출 완료! (야후 파이낸스는 업종PER 및 자사주 데이터를 기본 제공하지 않아 제외되었습니다.)")
             st.dataframe(df)
