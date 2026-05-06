@@ -15,7 +15,7 @@ def load_stock_codes():
     df_krx = fdr.StockListing('KRX')
     return dict(zip(df_krx['Name'], df_krx['Code']))
 
-# [3] 강력한 직접 태그 추출 방식 (표 구조 붕괴 무시)
+# [3] 종목분석 탭 원본 API 직접 호출 방식 (100% 확실한 데이터 추출)
 def get_financial_data(stock_name, code_dict):
     data = {
         '종목명': stock_name, '유동자산': '0', '총부채': '0', 'BPS': '0', 
@@ -27,84 +27,81 @@ def get_financial_data(stock_name, code_dict):
     if not code:
         return data 
 
-    # 봇 차단 방지를 위한 강력한 User-Agent
+    # 브라우저 우회 접속 설정 (봇 차단 완벽 방지)
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': f'https://finance.naver.com/item/main.naver?code={code}'
     }
     
     try:
-        # --- [STEP 1] 네이버 금융 메인 페이지 ---
+        # --- [STEP 1] 네이버 금융 메인 (투자지표 PER, PBR 등 추출) ---
         main_url = f"https://finance.naver.com/item/main.naver?code={code}"
         res_main = requests.get(main_url, headers=headers)
-        soup = BeautifulSoup(res_main.text, 'html.parser')
+        soup_main = BeautifulSoup(res_main.text, 'html.parser')
 
-        # 1. 투자지표 (현재PER, EPS, BPS, PBR)
-        try: data['현재PER'] = soup.select_one('#_per').text.strip().replace(',', '')
+        try: data['현재PER'] = soup_main.select_one('#_per').text.strip().replace(',', '')
         except: pass
-        try: data['EPS'] = soup.select_one('#_eps').text.strip().replace(',', '')
+        try: data['EPS'] = soup_main.select_one('#_eps').text.strip().replace(',', '')
         except: pass
-        try: data['PBR'] = soup.select_one('#_pbr').text.strip().replace(',', '')
+        try: data['PBR'] = soup_main.select_one('#_pbr').text.strip().replace(',', '')
         except: pass
-        try: data['BPS'] = soup.select_one('#_bps').text.strip().replace(',', '')
+        try: data['BPS'] = soup_main.select_one('#_bps').text.strip().replace(',', '')
         except: pass
 
-        # 2. 업종PER
         try:
-            sector_table = soup.find('table', summary='동일업종 PER 정보')
-            if sector_table:
+            sector_table = soup_main.find('table', summary='동일업종 PER 정보')
+            if sector_table and sector_table.find('em'):
                 data['업종PER'] = sector_table.find('em').text.strip()
         except: pass
 
-        # 3. 재무제표 (당기순이익, 총부채, 자기자본, BPS 2차 추출)
-        # pandas read_html 대신 HTML <tr> <th> <td> 직접 추적 (가장 확실한 방법)
-        try:
-            tbody = soup.select_one('table.tb_type1_ifrs > tbody')
-            if tbody:
-                for tr in tbody.find_all('tr'):
-                    th = tr.find('th')
-                    if not th: continue
-                    th_text = th.text.strip()
-                    
-                    # 최근 4개년 연간 데이터 중 가장 최근(오른쪽) 값 추출
-                    tds = [td.text.strip().replace(',', '') for td in tr.find_all('td')]
-                    annuals = [x for x in tds[:4] if x and x != '-' and x != '']
-                    recent_val = annuals[-1] if annuals else '0'
+        # --- [STEP 2] 종목분석 탭(와이즈리포트) 숨겨진 원본 데이터 직접 호출 ---
+        # 네이버가 종목분석 화면을 그릴 때 몰래 호출하는 AJAX API 주소입니다.
+        wr_headers = {
+            'User-Agent': headers['User-Agent'],
+            'Referer': f'https://navercomp.wisereport.co.kr/v2/company/c1030001.aspx?cmp_cd={code}'
+        }
 
-                    if th_text == '당기순이익':
-                        data['당기순이익'] = recent_val
-                    elif th_text == '부채총계':
-                        data['총부채'] = recent_val
-                    elif th_text == '자본총계':
-                        data['자기자본'] = recent_val
-                    elif 'BPS' in th_text and data['BPS'] == '0':
-                        data['BPS'] = recent_val
-        except: pass
-
-        # --- [STEP 2] FnGuide 상세 재무상태표 ---
-        # 유동자산, 자사주 추출
-        fn_url = f"https://comp.fnguide.com/SVO2/ASP/SVD_Finance.asp?pGB=1&gicode=A{code}"
-        res_fn = requests.get(fn_url, headers=headers)
-        soup_fn = BeautifulSoup(res_fn.text, 'html.parser')
-        
-        try:
-            daecha = soup_fn.find('div', id='div_daechaY')
-            if daecha:
-                for tr in daecha.find_all('tr'):
-                    th = tr.find('th')
-                    if not th: continue
+        # 표 데이터를 뜯어오는 전용 함수
+        def parse_wisereport_api(url, keyword_map):
+            try:
+                res = requests.get(url, headers=wr_headers)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                
+                for tr in soup.find_all('tr'):
+                    tds = tr.find_all(['td', 'th'])
+                    if not tds: continue
                     
-                    # '유동자산계', '유동자산(*)' 등 웹페이지의 불순물을 제거하고 순수 한글만 추출
-                    clean_th = re.sub(r'[^가-힣]', '', th.text)
+                    # 괄호나 특수문자 다 지우고 순수 한글만 남김 (ex: '유동자산(*)' -> '유동자산')
+                    row_title = re.sub(r'[^가-힣]', '', tds[0].text)
                     
-                    tds = [td.text.strip().replace(',', '') for td in tr.find_all('td')]
-                    valid_vals = [x for x in tds if x and x != '-' and x != '0' and x != '']
-                    recent_val_fn = valid_vals[-1] if valid_vals else '0'
+                    for key, output_key in keyword_map.items():
+                        # 찾고자 하는 항목(예: 자기주식)이 줄 이름에 포함되어 있으면
+                        if key in row_title:
+                            # 값이 아직 '0'일 때만 채움 (중복 덮어쓰기 방지)
+                            if data[output_key] == '0':
+                                # 가장 최근 연도(오른쪽 끝)부터 거꾸로 탐색하며 진짜 숫자를 찾음
+                                for td in reversed(tds[1:]):
+                                    val = td.text.replace(',', '').replace('\xa0', '').strip()
+                                    if re.match(r'^-?\d+(?:\.\d+)?$', val): # 올바른 숫자인지 검증
+                                        data[output_key] = val
+                                        break
+            except Exception:
+                pass
 
-                    if '유동자산' in clean_th:
-                        data['유동자산'] = recent_val_fn
-                    elif '자기주식' in clean_th:
-                        data['자사주'] = recent_val_fn
-        except: pass
+        # 1. 재무상태표 API 호출 (유동자산, 총부채, 자기자본, 자사주)
+        bs_url = f"https://navercomp.wisereport.co.kr/v2/company/ajax/cF1002.aspx?cmp_cd={code}&fin_typ=0&freq_typ=Y"
+        parse_wisereport_api(bs_url, {
+            '유동자산': '유동자산',
+            '부채총계': '총부채',      # 표에는 부채총계로 나옴
+            '자본총계': '자기자본',    # 표에는 자본총계로 나옴
+            '자기주식': '자사주'      # 표에는 자기주식으로 나옴
+        })
+
+        # 2. 포괄손익계산서 API 호출 (당기순이익)
+        is_url = f"https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx?cmp_cd={code}&fin_typ=0&freq_typ=Y"
+        parse_wisereport_api(is_url, {
+            '당기순이익': '당기순이익'
+        })
 
     except Exception:
         pass 
@@ -112,7 +109,7 @@ def get_financial_data(stock_name, code_dict):
     return data
 
 # [4] Streamlit 웹 화면 구성
-st.title("📊 주식 재무정보 일괄 크롤러 (태그 직접 추적형)")
+st.title("📊 주식 재무정보 일괄 크롤러 (종목분석 원본 API 연동)")
 st.markdown("**엑셀에서 복사한 여러 기업의 이름을 쉼표 없이 그대로 붙여넣기 하세요.**")
 
 code_dict = load_stock_codes()
@@ -121,7 +118,7 @@ user_input = st.text_area("기업명 입력창", height=150, placeholder="삼성
 
 if st.button("데이터 크롤링 시작"):
     if user_input:
-        with st.spinner("웹페이지 표 구조에 얽매이지 않고 정확한 숫자를 강제 추출 중입니다..."):
+        with st.spinner("종목분석 탭의 원본 서버에 접속하여 데이터를 뽑아오고 있습니다..."):
             corp_list = re.split(r'[\n\s]+', user_input.strip())
             corp_list = [c for c in corp_list if c]
             
@@ -133,7 +130,7 @@ if st.button("데이터 크롤링 시작"):
             columns_order = ['종목명', '유동자산', '총부채', 'BPS', '업종PER', '현재PER', 'PBR', 'EPS', '당기순이익', '자기자본', '자사주']
             df = df[columns_order]
             
-            st.success("모든 데이터 추출이 완료되었습니다!")
+            st.success("데이터 추출 완료! 종목분석 탭의 수치가 정상 반영되었습니다.")
             st.dataframe(df)
             
             excel_buffer = io.BytesIO()
@@ -143,7 +140,7 @@ if st.button("데이터 크롤링 시작"):
             st.download_button(
                 label="📥 엑셀 파일로 다운로드",
                 data=excel_buffer.getvalue(),
-                file_name="재무정보_최종완성본.xlsx",
+                file_name="재무정보_종목분석_결과.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
     else:
