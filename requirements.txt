@@ -1,4 +1,4 @@
 streamlit
-opendartreader
+OpenDartReader
 pandas
 openpyxl
